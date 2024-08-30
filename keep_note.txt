@@ -1,0 +1,774 @@
+Integrating **MongoDB** for persistent storage, **Prometheus** for monitoring, and **Grafana** for visualization will enhance your model management platform by providing robust data storage, real-time monitoring, and insightful dashboards. Below is a comprehensive guide to integrating these components into your existing setup.
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Integrating MongoDB](#integrating-mongodb)
+    - [1. Setting Up MongoDB](#1-setting-up-mongodb)
+    - [2. Updating the `ModelRegistry` and `DownloadTracker` Classes](#2-updating-the-modelregistry-and-downloadtracker-classes)
+3. [Integrating Prometheus and Grafana](#integrating-prometheus-and-grafana)
+    - [1. Setting Up Prometheus](#1-setting-up-prometheus)
+    - [2. Setting Up Grafana](#2-setting-up-grafana)
+    - [3. Integrating Prometheus with FastAPI](#3-integrating-prometheus-with-fastapi)
+4. [Dockerizing the Setup with Docker Compose](#dockerizing-the-setup-with-docker-compose)
+5. [Final Project Structure](#final-project-structure)
+6. [Running the Entire Setup](#running-the-entire-setup)
+7. [Accessing Grafana Dashboards](#accessing-grafana-dashboards)
+8. [Summary](#summary)
+
+---
+
+## Prerequisites
+
+Before proceeding, ensure you have the following installed on your system:
+
+- **Python 3.7+**
+- **Docker** and **Docker Compose**
+- **Git** (optional, for cloning repositories)
+- **AWS Credentials** configured for accessing S3 (if not already done)
+
+---
+
+## Integrating MongoDB
+
+### 1. Setting Up MongoDB
+
+To integrate MongoDB, we'll use **Motor**, an asynchronous Python driver for MongoDB, which works seamlessly with FastAPI.
+
+#### **a. Install Motor**
+
+Activate your virtual environment and install `motor`:
+
+```bash
+pip install motor
+```
+
+#### **b. Update `server.py` with MongoDB Connection**
+
+Create a new file `database.py` to handle MongoDB connections:
+
+```python
+# database.py
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson.objectid import ObjectId
+from typing import List
+import os
+
+class Database:
+    def __init__(self, uri: str, db_name: str):
+        self.client = AsyncIOMotorClient(uri)
+        self.db = self.client[db_name]
+
+    async def register_model(self, model_data: dict):
+        result = await self.db.models.insert_one(model_data)
+        return str(result.inserted_id)
+
+    async def get_model(self, model_name: str):
+        model = await self.db.models.find_one({"name": model_name})
+        return model
+
+    async def list_models(self) -> List[dict]:
+        models = []
+        async for model in self.db.models.find():
+            model['_id'] = str(model['_id'])
+            models.append(model)
+        return models
+
+    async def log_download_event(self, event_data: dict):
+        await self.db.download_logs.insert_one(event_data)
+```
+
+### 2. Updating the `ModelRegistry` and `DownloadTracker` Classes
+
+Modify the existing classes to interact with MongoDB.
+
+#### **a. Update `ModelRegistry`**
+
+```python
+# model_registry.py
+from database import Database
+
+class ModelRegistry:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def register_model(self, model: dict):
+        existing_model = await self.db.get_model(model['name'])
+        if existing_model:
+            raise ValueError(f"Model with name {model['name']} is already registered.")
+        model_id = await self.db.register_model(model)
+        return model_id
+
+    async def get_model(self, model_name: str) -> dict:
+        model = await self.db.get_model(model_name)
+        if not model:
+            raise ValueError(f"Model with name {model_name} not found.")
+        return model
+
+    async def list_models(self) -> list:
+        return await self.db.list_models()
+```
+
+#### **b. Update `DownloadTracker`**
+
+```python
+# download_tracker.py
+import boto3
+import os
+import logging
+import time
+from database import Database
+
+class DownloadTracker:
+    def __init__(self, db: Database, log_file: str = 'download_logs.log'):
+        self.db = db
+        self.s3 = boto3.client('s3')
+        logging.basicConfig(filename=log_file, level=logging.INFO)
+
+    async def log_download_event(self, engineer: str, model: dict, model_size: int, download_time: float):
+        event = {
+            "engineer": engineer,
+            "model_name": model['name'],
+            "project_name": model['project_name'],
+            "size_bytes": model_size,
+            "download_time_seconds": download_time,
+            "timestamp": time.time()
+        }
+        await self.db.log_download_event(event)
+        logging.info(f"Logged download event: {event}")
+
+    async def download_model(self, model_name: str) -> str:
+        model = await self.db.get_model(model_name)
+        bucket_url = model['bucket_url']
+        key = model['key']
+        bucket_name = bucket_url.replace("s3://", "").split('/')[0]
+        model_path = f"/tmp/{model_name}"  # Temp storage location
+        self.s3.download_file(bucket_name, key, model_path)
+        return model_path
+
+    def get_model_size(self, model_path: str) -> int:
+        return os.path.getsize(model_path)
+
+    def clean_up(self, model_path: str):
+        if os.path.exists(model_path):
+            os.remove(model_path)
+```
+
+### 3. Updating `RealServer` with MongoDB Integration
+
+Modify `RealServer` to use the updated `ModelRegistry` and `DownloadTracker` that interact with MongoDB.
+
+```python
+# server.py
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+import time
+import os
+from model_registry import ModelRegistry
+from download_tracker import DownloadTracker
+from database import Database
+import uvicorn
+
+class RealServer:
+    def __init__(self, registry: ModelRegistry, tracker: DownloadTracker):
+        self.registry = registry
+        self.tracker = tracker
+        self.app = FastAPI()
+        self.setup_routes()
+
+    def setup_routes(self):
+        @self.app.post("/register_model/")
+        async def register_model(model: dict):
+            try:
+                model_id = await self.registry.register_model(model)
+                return {"message": f"Model '{model['name']}' registered successfully.", "id": model_id}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+        @self.app.get("/download/{model_name}")
+        async def download_model(model_name: str, request: Request):
+            engineer = request.headers.get('X-Engineer-ID', 'Unknown')
+            model_path = None
+            try:
+                start_time = time.time()
+                model_path = await self.tracker.download_model(model_name)
+                download_time = time.time() - start_time
+                model_size = self.tracker.get_model_size(model_path)
+                model = await self.registry.get_model(model_name)
+                await self.tracker.log_download_event(engineer, model, model_size, download_time)
+                return FileResponse(model_path, media_type='application/octet-stream', filename=model_name)
+            except Exception as e:
+                raise HTTPException(status_code=404, detail=f"Error downloading model: {str(e)}")
+            finally:
+                if model_path:
+                    self.tracker.clean_up(model_path)
+
+        @self.app.get("/list_models/")
+        async def list_models():
+            models = await self.registry.list_models()
+            return {"models": models}
+
+if __name__ == "__main__":
+    # MongoDB connection URI
+    MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+    DB_NAME = os.getenv("DB_NAME", "model_db")
+
+    # Initialize Database, ModelRegistry, and DownloadTracker
+    db = Database(uri=MONGODB_URI, db_name=DB_NAME)
+    registry = ModelRegistry(db)
+    tracker = DownloadTracker(db)
+    server = RealServer(registry, tracker)
+
+    # Run the FastAPI app with Uvicorn
+    uvicorn.run(server.app, host="0.0.0.0", port=8001)
+```
+
+---
+
+## Integrating Prometheus and Grafana
+
+### 1. Setting Up Prometheus
+
+Prometheus will scrape metrics from your FastAPI application. We'll use the `prometheus_client` library to expose metrics.
+
+#### **a. Install `prometheus_client`**
+
+```bash
+pip install prometheus_client
+```
+
+#### **b. Update `server.py` to Include Prometheus Middleware**
+
+Add Prometheus metrics to your FastAPI app by integrating middleware and defining metrics.
+
+```python
+# server.py (continued)
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Response
+
+class RealServer:
+    def __init__(self, registry: ModelRegistry, tracker: DownloadTracker):
+        self.registry = registry
+        self.tracker = tracker
+        self.app = FastAPI()
+        self.setup_metrics()
+        self.setup_routes()
+
+    def setup_metrics(self):
+        # Define Prometheus metrics
+        self.metrics_downloads = Counter('model_downloads_total', 'Total number of model downloads', ['model_name', 'engineer'])
+        self.metrics_download_time = Histogram('model_download_time_seconds', 'Time spent downloading model', ['model_name'])
+        self.metrics_registrations = Counter('model_registrations_total', 'Total number of model registrations', ['model_name'])
+
+    def setup_routes(self):
+        @self.app.post("/register_model/")
+        async def register_model(model: dict):
+            try:
+                model_id = await self.registry.register_model(model)
+                self.metrics_registrations.labels(model_name=model['name']).inc()
+                return {"message": f"Model '{model['name']}' registered successfully.", "id": model_id}
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+        @self.app.get("/download/{model_name}")
+        async def download_model(model_name: str, request: Request):
+            engineer = request.headers.get('X-Engineer-ID', 'Unknown')
+            model_path = None
+            try:
+                with self.metrics_download_time.labels(model_name=model_name).time():
+                    start_time = time.time()
+                    model_path = await self.tracker.download_model(model_name)
+                    download_time = time.time() - start_time
+                    model_size = self.tracker.get_model_size(model_path)
+                    model = await self.registry.get_model(model_name)
+                    await self.tracker.log_download_event(engineer, model, model_size, download_time)
+                    self.metrics_downloads.labels(model_name=model_name, engineer=engineer).inc()
+                return FileResponse(model_path, media_type='application/octet-stream', filename=model_name)
+            except Exception as e:
+                raise HTTPException(status_code=404, detail=f"Error downloading model: {str(e)}")
+            finally:
+                if model_path:
+                    self.tracker.clean_up(model_path)
+
+        @self.app.get("/list_models/")
+        async def list_models():
+            models = await self.registry.list_models()
+            return {"models": models}
+
+        @self.app.get("/metrics/")
+        async def metrics():
+            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+```
+
+### 2. Setting Up Grafana
+
+Grafana will visualize the metrics collected by Prometheus.
+
+#### **a. Install Grafana**
+
+Follow the [official Grafana installation guide](https://grafana.com/docs/grafana/latest/installation/) for your operating system. Alternatively, you can use Docker:
+
+```bash
+docker pull grafana/grafana
+docker run -d -p 3000:3000 --name=grafana grafana/grafana
+```
+
+#### **b. Configure Grafana to Use Prometheus as a Data Source**
+
+1. **Access Grafana:**
+
+   Open your browser and navigate to `http://localhost:3000`. The default login is `admin/admin`.
+
+2. **Add Prometheus Data Source:**
+
+   - Click on **"Add your first data source"** or navigate to **Configuration > Data Sources > Add data source**.
+   - Select **Prometheus**.
+   - Set the **URL** to `http://prometheus:9090` if using Docker Compose, or `http://localhost:9090` otherwise.
+   - Click **"Save & Test"** to verify the connection.
+
+### 3. Integrating Prometheus with FastAPI
+
+Prometheus needs to scrape metrics from the `/metrics` endpoint of your FastAPI application. Ensure that Prometheus is configured to scrape this endpoint.
+
+---
+
+## Dockerizing the Setup with Docker Compose
+
+To simplify the deployment of MongoDB, Prometheus, Grafana, and your FastAPI application, we'll use Docker Compose.
+
+### 1. **Create a `docker-compose.yml` File**
+
+Create a `docker-compose.yml` file in your project root:
+
+```yaml
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: fastapi_app
+    ports:
+      - "8001:8001"
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - DB_NAME=model_db
+    depends_on:
+      - mongo
+      - prometheus
+
+  mongo:
+    image: mongo:5.0
+    container_name: mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  mongo_data:
+  grafana_data:
+```
+
+### 2. **Create a `Dockerfile` for the FastAPI Application**
+
+Create a `Dockerfile` in your project root:
+
+```dockerfile
+# Dockerfile
+FROM python:3.9-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Set work directory
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
+
+# Copy project
+COPY . .
+
+# Expose port
+EXPOSE 8001
+
+# Run the application
+CMD ["python", "server.py"]
+```
+
+### 3. **Create `requirements.txt`**
+
+List all Python dependencies in `requirements.txt`:
+
+```
+fastapi
+uvicorn
+motor
+boto3
+requests
+prometheus_client
+```
+
+### 4. **Configure Prometheus**
+
+Create a `prometheus.yml` file in your project root:
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'fastapi_app'
+    static_configs:
+      - targets: ['app:8001']
+```
+
+This configuration tells Prometheus to scrape metrics from the FastAPI app's `/metrics` endpoint every 15 seconds.
+
+---
+
+## Final Project Structure
+
+Your project directory should look like this:
+
+```
+your_project/
+├── docker-compose.yml
+├── Dockerfile
+├── prometheus.yml
+├── requirements.txt
+├── server.py
+├── database.py
+├── model_registry.py
+├── download_tracker.py
+├── client.py
+```
+
+Ensure all the Python modules (`server.py`, `database.py`, `model_registry.py`, `download_tracker.py`, `client.py`) are correctly placed in the project root or adjust import paths accordingly.
+
+---
+
+## Running the Entire Setup
+
+With Docker and Docker Compose installed, you can build and run all services with a single command.
+
+### 1. **Build and Start Services**
+
+Navigate to your project directory and run:
+
+```bash
+docker-compose up --build
+```
+
+This command will:
+
+- Build the FastAPI application container.
+- Start MongoDB, Prometheus, and Grafana containers.
+- Link the services together as defined in `docker-compose.yml`.
+
+### 2. **Verify Services are Running**
+
+- **FastAPI App:** Accessible at `http://localhost:8001`.
+- **Prometheus:** Accessible at `http://localhost:9090`.
+- **Grafana:** Accessible at `http://localhost:3000`.
+
+---
+
+## Accessing Grafana Dashboards
+
+Once all services are up and running, you can configure Grafana to visualize Prometheus metrics.
+
+### 1. **Log in to Grafana**
+
+- Open your browser and go to `http://localhost:3000`.
+- Login with default credentials:
+  - **Username:** `admin`
+  - **Password:** `admin`
+
+### 2. **Add Prometheus as a Data Source**
+
+If you haven't added Prometheus as a data source during setup:
+
+- Navigate to **Configuration > Data Sources > Add data source**.
+- Select **Prometheus**.
+- Set the **URL** to `http://prometheus:9090`.
+- Click **"Save & Test"**.
+
+### 3. **Create a Dashboard**
+
+1. **Add a New Dashboard:**
+
+   - Click on the **"+"** icon on the left sidebar.
+   - Select **"Dashboard"**.
+   - Click **"Add new panel"**.
+
+2. **Add Panels for Metrics:**
+
+   - **Total Model Registrations:**
+     - **Query:** `model_registrations_total`
+     - **Visualization:** Counter, Gauge, or any preferred type.
+
+   - **Total Model Downloads:**
+     - **Query:** `model_downloads_total`
+     - **Visualization:** Bar chart, time series, etc.
+
+   - **Download Time Histogram:**
+     - **Query:** `model_download_time_seconds`
+     - **Visualization:** Histogram or heatmap.
+
+   - **Customize and Save:**
+
+     - Arrange panels as desired.
+     - Click **"Save dashboard"**, give it a name (e.g., "Model Monitoring"), and save.
+
+3. **Explore Metrics:**
+
+   - Navigate to **"Explore"** to query and visualize metrics in real-time.
+
+### 4. **Sample Grafana Dashboard**
+
+For convenience, here's a basic JSON configuration for a Grafana dashboard that includes panels for model registrations and downloads. You can import it into Grafana:
+
+```json
+{
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Total Model Registrations",
+      "targets": [
+        {
+          "expr": "model_registrations_total",
+          "format": "time_series",
+          "interval": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Total Model Downloads",
+      "targets": [
+        {
+          "expr": "model_downloads_total",
+          "format": "time_series",
+          "interval": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Model Download Time",
+      "targets": [
+        {
+          "expr": "model_download_time_seconds",
+          "format": "time_series",
+          "interval": "",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "title": "Model Monitoring",
+  "version": 1
+}
+```
+
+To import:
+
+- Go to **Dashboards > Manage > Import**.
+- Paste the JSON or upload a JSON file.
+- Assign it to a folder and click **"Import"**.
+
+---
+
+## Running the Client
+
+With the server running inside Docker, you can run the client either inside another Docker container or on your host machine. For simplicity, we'll run it on the host.
+
+### 1. **Ensure Dependencies are Installed**
+
+Make sure your virtual environment is activated and all dependencies are installed (`requests`, etc.).
+
+### 2. **Update `client.py` to Point to the Correct Server URL**
+
+```python
+# client.py
+import requests
+import os
+import logging
+
+class ModelClient:
+    def __init__(self, server_url: str, engineer_id: str):
+        self.server_url = server_url
+        self.engineer_id = engineer_id
+        logging.basicConfig(level=logging.INFO)
+
+    def register_model(self, name: str, user: str, project_name: str, bucket_url: str, key: str):
+        """Register a model on the server."""
+        model_data = {
+            "name": name,
+            "user": user,
+            "project_name": project_name,
+            "bucket_url": bucket_url,
+            "key": key
+        }
+        response = requests.post(f"{self.server_url}/register_model/", json=model_data)
+        if response.status_code == 200:
+            logging.info(f"Model '{name}' registered successfully. ID: {response.json().get('id')}")
+        else:
+            logging.error(f"Failed to register model '{name}': {response.text}")
+
+    def download_model(self, model_name: str, save_path: str):
+        """Download a model by name and save it to the specified path."""
+        headers = {'X-Engineer-ID': self.engineer_id}
+        response = requests.get(f"{self.server_url}/download/{model_name}", headers=headers, stream=True)
+        
+        if response.status_code == 200:
+            os.makedirs(save_path, exist_ok=True)
+            file_path = os.path.join(save_path, model_name)
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logging.info(f"Model '{model_name}' downloaded and saved to '{file_path}'.")
+        else:
+            logging.error(f"Failed to download model '{model_name}': {response.text}")
+
+    def list_models(self):
+        """List all registered models on the server."""
+        response = requests.get(f"{self.server_url}/list_models/")
+        if response.status_code == 200:
+            models = response.json().get('models', [])
+            logging.info(f"Registered models: {models}")
+            return models
+        else:
+            logging.error(f"Failed to list models: {response.text}")
+            return []
+```
+
+### 3. **Example Client Usage**
+
+Create a `client_script.py` to interact with the server:
+
+```python
+# client_script.py
+from client import ModelClient
+
+if __name__ == "__main__":
+    client = ModelClient(server_url="http://localhost:8001", engineer_id="JohnDoe")
+
+    # Register a new model
+    client.register_model(
+        name="model_v1",
+        user="JohnDoe",
+        project_name="ProjectAlpha",
+        bucket_url="your-s3-bucket-name",
+        key="models/model_v1.pkl"
+    )
+
+    # List all models
+    models = client.list_models()
+    print(models)
+
+    # Download a model
+    client.download_model(model_name="model_v1", save_path="./downloads")
+```
+
+Run the client script:
+
+```bash
+python client_script.py
+```
+
+---
+
+## Accessing Prometheus Metrics
+
+Prometheus scrapes metrics from your FastAPI application's `/metrics` endpoint.
+
+### 1. **Verify Prometheus is Scraping Metrics**
+
+- Navigate to `http://localhost:9090`.
+- In the **"Targets"** section under **"Status"**, you should see the `fastapi_app` target listed as `UP`.
+
+### 2. **Query Metrics in Prometheus**
+
+Use the Prometheus UI to query metrics such as:
+
+- `model_registrations_total`
+- `model_downloads_total`
+- `model_download_time_seconds`
+
+---
+
+## Deployment Considerations
+
+### 1. **Environment Variables**
+
+For security and flexibility, consider using environment variables for sensitive information like AWS credentials, MongoDB URI, etc.
+
+Update your `docker-compose.yml` to include necessary environment variables, or use Docker secrets for sensitive data.
+
+### 2. **Persistent Storage**
+
+Ensure that data in MongoDB and Grafana is persisted by using Docker volumes, as configured in the `docker-compose.yml`.
+
+### 3. **Scaling Services**
+
+You can scale your FastAPI application using Docker Compose by increasing the number of replicas or using Kubernetes for orchestration.
+
+### 4. **Secure Communication**
+
+- **HTTPS:** Configure HTTPS for secure communication.
+- **Authentication:** Implement authentication and authorization for your API endpoints.
+- **Firewall:** Protect your services with appropriate firewall rules.
+
+---
+
+## Summary
+
+By following this guide, you have successfully:
+
+1. **Integrated MongoDB** for persistent storage of model registrations and download logs using the `motor` library.
+2. **Implemented Prometheus Monitoring** by exposing metrics from your FastAPI application and configuring Prometheus to scrape these metrics.
+3. **Set Up Grafana** to visualize the collected metrics, enabling real-time monitoring and insightful dashboards.
+4. **Dockerized the Entire Setup** using Docker Compose for easy deployment and scalability.
+
+This architecture ensures a scalable, maintainable, and observable system for managing and monitoring model downloads. You can further enhance this setup by adding authentication, deploying to cloud platforms, and implementing additional monitoring and alerting mechanisms.
+
+---
+
+## Additional Resources
+
+- **FastAPI Documentation:** [https://fastapi.tiangolo.com/](https://fastapi.tiangolo.com/)
+- **Motor Documentation:** [https://motor.readthedocs.io/en/stable/](https://motor.readthedocs.io/en/stable/)
+- **Prometheus Documentation:** [https://prometheus.io/docs/introduction/overview/](https://prometheus.io/docs/introduction/overview/)
+- **Grafana Documentation:** [https://grafana.com/docs/](https://grafana.com/docs/)
+- **Docker Documentation:** [https://docs.docker.com/](https://docs.docker.com/)
+
+Feel free to explore these resources to deepen your understanding and further customize your platform.
