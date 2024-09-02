@@ -1,0 +1,278 @@
+To include `model_metadata` of type `dict` in the `Model` class and adjust the entire codebase accordingly, we'll make a few changes:
+
+1. Modify the `Model` class in `app/models.py` to include the `model_metadata` field.
+2. Update the SQLAlchemy model to handle JSON/dict storage using PostgreSQL’s `JSONB` type.
+3. Modify the `ModelRegistry`, `DownloadTracker`, and `server.py` to accommodate this change.
+4. Use `APIRouter` in FastAPI to organize the routes.
+
+Here’s the complete code with these updates:
+
+### 1. **Modify `Model` Class in `app/models.py`**
+
+We'll add the `model_metadata` field to the `Model` class. Since PostgreSQL supports storing JSON data, we'll use SQLAlchemy's `JSONB` type.
+
+```python
+from sqlalchemy import Column, Integer, String, Float, JSON
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+class Model(Base):
+    __tablename__ = 'models'
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    user = Column(String)
+    project_name = Column(String)
+    bucket_url = Column(String)
+    key = Column(String)
+    model_metadata = Column(JSON)  # Storing the metadata as JSON
+
+class DownloadLog(Base):
+    __tablename__ = 'download_logs'
+
+    id = Column(Integer, primary_key=True, index=True)
+    engineer = Column(String)
+    model_name = Column(String)
+    project_name = Column(String)
+    size_bytes = Column(Integer)
+    download_time_seconds = Column(Float)
+    timestamp = Column(Float)
+```
+
+### 2. **Update `ModelRegistry` in `app/model_registry.py`**
+
+Ensure that the `model_metadata` is handled when registering and retrieving models.
+
+```python
+from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models import Model
+
+class ModelRegistry:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def register_model(self, model_data: dict):
+        new_model = Model(**model_data)
+        self.db.add(new_model)
+        try:
+            await self.db.commit()
+            await self.db.refresh(new_model)
+            return new_model.id
+        except IntegrityError:
+            await self.db.rollback()
+            raise ValueError(f"Model with name {model_data['name']} is already registered.")
+
+    async def get_model(self, model_name: str) -> Model:
+        result = await self.db.execute(select(Model).where(Model.name == model_name))
+        model = result.scalars().first()
+        if not model:
+            raise ValueError(f"Model with name {model_name} not found.")
+        return model
+
+    async def list_models(self):
+        result = await self.db.execute(select(Model))
+        return result.scalars().all()
+```
+
+### 3. **Update `DownloadTracker` in `app/download_tracker.py`**
+
+The `DownloadTracker` now needs to ensure that the metadata is correctly handled when interacting with the model.
+
+```python
+import boto3
+import os
+import time
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models import DownloadLog
+
+class DownloadTracker:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+        self.s3 = boto3.client(
+            's3',
+            endpoint_url=os.getenv('MINIO_ENDPOINT', 'http://localhost:9000'),
+            aws_access_key_id=os.getenv('MINIO_ACCESS_KEY', 'admin'),
+            aws_secret_access_key=os.getenv('MINIO_SECRET_KEY', 'password')
+        )
+
+    async def log_download_event(self, engineer: str, model: Model, model_size: int, download_time: float):
+        log_entry = DownloadLog(
+            engineer=engineer,
+            model_name=model.name,
+            project_name=model.project_name,
+            size_bytes=model_size,
+            download_time_seconds=download_time,
+            timestamp=time.time()
+        )
+        self.db.add(log_entry)
+        await self.db.commit()
+
+    async def download_model(self, model_name: str) -> str:
+        model = await self.db.get_model(model_name)
+        bucket_url = model.bucket_url
+        key = model.key
+        bucket_name = bucket_url.replace("s3://", "").split('/')[0]
+        model_path = f"/tmp/{model_name}"
+        self.s3.download_file(bucket_name, key, model_path)
+        return model_path
+
+    def get_model_size(self, model_path: str) -> int:
+        return os.path.getsize(model_path)
+
+    def clean_up(self, model_path: str):
+        if os.path.exists(model_path):
+            os.remove(model_path)
+```
+
+### 4. **Refactor FastAPI Application with APIRouter in `app/server.py`**
+
+We'll refactor the `server.py` to use `APIRouter` for cleaner route management.
+
+```python
+from fastapi import FastAPI, HTTPException, Request, Depends, APIRouter
+from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db, init_db
+from app.model_registry import ModelRegistry
+from app.download_tracker import DownloadTracker
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import uvicorn
+
+# Prometheus Metrics
+model_registration_counter = Counter('model_registrations_total', 'Total number of model registrations')
+model_download_counter = Counter('model_downloads_total', 'Total number of model downloads')
+model_download_time_histogram = Histogram('model_download_time_seconds', 'Time spent downloading a model')
+
+# FastAPI Application
+app = FastAPI(on_startup=[init_db])
+router = APIRouter()
+
+@router.post("/register_model/")
+async def register_model(model: dict, db: AsyncSession = Depends(get_db)):
+    registry = ModelRegistry(db)
+    try:
+        model_id = await registry.register_model(model)
+        model_registration_counter.inc()
+        return {"message": f"Model '{model['name']}' registered successfully.", "id": model_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/download/{model_name}")
+async def download_model(model_name: str, request: Request, db: AsyncSession = Depends(get_db)):
+    tracker = DownloadTracker(db)
+    engineer = request.headers.get('X-Engineer-ID', 'Unknown')
+    model_path = None
+    try:
+        with model_download_time_histogram.time():
+            model_path = await tracker.download_model(model_name)
+            model_size = tracker.get_model_size(model_path)
+            model = await tracker.db.get_model(model_name)
+            await tracker.log_download_event(engineer, model, model_size, time.time())
+            model_download_counter.inc()
+        return FileResponse(model_path, media_type='application/octet-stream', filename=model_name)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Error downloading model: {str(e)}")
+    finally:
+        if model_path:
+            tracker.clean_up(model_path)
+
+@router.get("/list_models/")
+async def list_models(db: AsyncSession = Depends(get_db)):
+    registry = ModelRegistry(db)
+    models = await registry.list_models()
+    return {"models": models}
+
+@router.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+# Include the router in the FastAPI app
+app.include_router(router)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+```
+
+### 5. **Client Script (`app/client.py`)**
+
+No significant changes are needed in the client script except to ensure that `model_metadata` can be passed during model registration.
+
+```python
+import requests
+import os
+import logging
+
+class ModelClient:
+    def __init__(self, server_url: str, engineer_id: str):
+        self.server_url = server_url
+        self.engineer_id = engineer_id
+        logging.basicConfig(level=logging.INFO)
+
+    def register_model(self, name: str, user: str, project_name: str, bucket_url: str, key: str, model_metadata: dict):
+        model_data = {
+            "name": name,
+            "user": user,
+            "project_name": project_name,
+            "bucket_url": bucket_url,
+            "key": key,
+            "model_metadata": model_metadata
+        }
+        response = requests.post(f"{self.server_url}/register_model/", json=model_data)
+        if response.status_code == 200:
+            logging.info(f"Model '{name}' registered successfully. ID: {response.json().get('id')}")
+        else:
+            logging.error(f"Failed to register model '{name}': {response.text}")
+
+    def download_model(self, model_name: str, save_path: str):
+        headers = {'X-Engineer-ID': self.engineer_id}
+        response = requests.get(f"{self.server_url}/download/{model_name}", headers=headers, stream=True)
+        
+        if response.status_code == 200:
+            os.makedirs(save_path, exist_ok=True)
+            file_path = os.path.join(save_path, model_name)
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logging.info(f"Model '{model_name}' downloaded and saved to '{file_path}'.")
+        else:
+            logging.error(f"Failed to download model '{model_name}': {response.text}")
+
+    def list_models(self):
+        response = requests.get(f"{self.server_url}/list_models/")
+        if response.status_code == 200:
+            models = response.json().get('models', [])
+            logging.info(f"
+
+Registered models: {models}")
+            return models
+        else:
+            logging.error(f"Failed to list models: {response.text}")
+            return []
+```
+
+### 6. **Running the Project**
+
+1. **Build and Start Services:**
+   ```bash
+   docker-compose up --build
+   ```
+
+2. **Access Services:**
+   - **FastAPI App:** `http://localhost:8001`
+   - **MinIO Console:** `http://localhost:9001`
+   - **Prometheus:** `http://localhost:9090`
+   - **Grafana:** `http://localhost:3000`
+
+3. **Client Usage:**
+   Use the `ModelClient` in your Python scripts to interact with the FastAPI app.
+
+### Summary
+
+- **Model Metadata:** The `model_metadata` field was added as a `dict` in the `Model` class, stored in PostgreSQL as JSON.
+- **APIRouter:** The FastAPI application was refactored to use `APIRouter` for better route management.
+- **Client Adjustments:** The client was updated to handle `model_metadata` during model registration.
+
+This setup allows you to manage and monitor models with additional metadata in a structured and scalable way.
